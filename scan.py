@@ -25,7 +25,8 @@ import zipfile
 GENERIC = {
     "ASIN": re.compile(r"\bB0[A-Z0-9]{8}\b"),
     "店铺名": re.compile(r"\d+\.[\u4e00-\u9fa5]{2,}-(?:DE|FR|ES|IT|UK|US|MX|CA|JP|AU|AE|SA|NL|BE|SE|PL|IE)\b"),
-    "金额": re.compile(r"(?:MX\$|€|£)\s?\d{1,3}(?:[,.]\d{3})*(?:\.\d+)?"),
+    # 只报「百元以上」的金额：单价/费率是技能正文，营收/成本/发票才是敏感数据
+    "金额(百元以上)": re.compile(r"(?:MX\$|€|£)\s?\d{3,}(?:[,.]\d{3})*(?:\.\d+)?"),
     "邮箱": re.compile(r"[\w.+-]+@[\w-]{2,}\.[\w.]{2,}"),
     "手机号": re.compile(r"(?<![\w(])1[3-9]\d{9}(?![\w)])"),
     "私钥": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -39,7 +40,7 @@ PLACEHOLDER = [
     re.compile(r"^ASIN_[A-Z0-9_]+$"),
 ]
 STORE_PLACEHOLDER = re.compile(r"^(?:店铺[A-Z]|BRAND_[A-Z]|[A-Za-z]{1,4})$")
-PATH_USER_OK = {"user", "username", "you", "yourname"}
+PATH_USER_OK = {"user", "username", "you", "yourname", "[user]", "<user>", "{user}"}
 
 # 明显是示例/文档数据的形态，不算命中
 EXAMPLE_DOMAIN = re.compile(r"@(?:example\.(?:com|org|net)|test\.(?:com|org)|localhost)$", re.I)
