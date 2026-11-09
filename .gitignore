@@ -1,0 +1,9 @@
+# 本地运行产物
+__pycache__/
+*.pyc
+
+# 脱敏草稿与备份，都可能含真实数据
+map.suggested.txt
+map*.txt
+*.bundle
+guard-backup-*

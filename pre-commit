@@ -1,0 +1,25 @@
+#!/bin/sh
+# git-guard pre-commit：提交前扫描暂存区
+# 绕过：git commit --no-verify
+
+GUARD_HOME="${GIT_GUARD_HOME:-$HOME/.git-guard}"
+SCAN="$GUARD_HOME/scan.py"
+
+if [ ! -f "$SCAN" ]; then
+  echo "[git-guard] 未安装扫描器（$SCAN），跳过检查。"
+  exit 0
+fi
+
+PY=$(command -v python || command -v python3 || command -v py)
+if [ -z "$PY" ]; then
+  echo "[git-guard] 警告：找不到 python，提交前检查未执行。"
+  exit 0
+fi
+
+"$PY" "$SCAN" --staged
+rc=$?
+if [ $rc -eq 2 ]; then
+  echo "[git-guard] 扫描器异常（exit 2）。如确需提交：git commit --no-verify"
+  exit 1
+fi
+exit $rc

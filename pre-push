@@ -1,0 +1,55 @@
+#!/bin/sh
+# git-guard pre-push：推送前扫描待推内容（含历史里尚未上传的部分）
+# 绕过：git push --no-verify
+
+GUARD_HOME="${GIT_GUARD_HOME:-$HOME/.git-guard}"
+SCAN="$GUARD_HOME/scan.py"
+
+if [ ! -f "$SCAN" ]; then
+  echo "[git-guard] 未安装扫描器（$SCAN），跳过检查。"
+  exit 0
+fi
+
+PY=$(command -v python || command -v python3 || command -v py)
+if [ -z "$PY" ]; then
+  echo "[git-guard] 警告：找不到 python，推送前检查未执行。"
+  exit 0
+fi
+
+ZERO=0000000000000000000000000000000000000000
+EXPR=""
+
+# stdin 每行: <local ref> <local sha> <remote ref> <remote sha>
+while read -r lref lsha rref rsha; do
+  [ -z "$lsha" ] && continue
+  case "$lsha" in
+    "$ZERO") continue ;;
+  esac
+  if [ -z "$rsha" ] || [ "$rsha" = "$ZERO" ]; then
+    # 新分支：只取尚未存在于任何远程的提交
+    EXPR="$EXPR$lsha --not --remotes
+"
+  else
+    EXPR="$EXPR$rsha..$lsha
+"
+  fi
+done
+
+if [ -z "$EXPR" ]; then
+  exit 0
+fi
+
+COMMITS=$(printf '%s' "$EXPR" | tr '\n' ' ')
+COUNT=$(git rev-list $COMMITS 2>/dev/null | wc -l | tr -d ' ')
+case "$COUNT" in
+  0|"") exit 0 ;;
+esac
+
+echo "[git-guard] 待推送 $COUNT 个提交，开始扫描..."
+printf '%s' "$EXPR" | "$PY" "$SCAN" --ranges-stdin
+rc=$?
+if [ $rc -eq 2 ]; then
+  echo "[git-guard] 扫描器异常（exit 2）。如确需推送：git push --no-verify"
+  exit 1
+fi
+exit $rc
