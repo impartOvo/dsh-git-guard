@@ -23,14 +23,18 @@ python install.py
 
 `install.py` 做三件事：
 
-1. 把 `scan.py` 复制到 `~/.git-guard/scan.py`
-2. 把 `pre-commit` / `pre-push` 装到 `~/.git-templates/hooks/`
+1. 把 `scan.py` / `sanitize.py` 复制到 `~/.git-guard/`
+2. 把 `pre-commit` / `commit-msg` / `pre-push` 装到 `~/.git-templates/hooks/`
 3. 设置 `git config --global init.templateDir ~/.git-templates`
+
+装完会顺手体检你的环境：`core.hooksPath` 是否被 husky/lefthook 占着、
+`python` 是不是 Microsoft Store 的占位存根、`init.templateDir` 是否会被覆盖 —— 这三种情况都会让钩子静默失效。
 
 **只对之后新建/新克隆的仓库自动生效。** 已有仓库补装：
 
 ```bash
 cp ~/.git-templates/hooks/pre-commit .git/hooks/
+cp ~/.git-templates/hooks/commit-msg .git/hooks/
 cp ~/.git-templates/hooks/pre-push   .git/hooks/
 ```
 
@@ -47,6 +51,17 @@ cp ~/.git-templates/hooks/pre-push   .git/hooks/
 | 私钥 | `-----BEGIN ... PRIVATE KEY-----` |
 | 疑似凭据 | `api_key` / `secret` / `password` 后跟 12 位以上值 |
 | 本地路径 | `C:\Users\<用户名>` |
+| **提交信息** | `commit-msg` 钩子扫 `-m` 里的同一套规则 |
+
+**编码不是只认 UTF-8。** 同一个文件会按证据判定编码后解码，下面三种过去整段失明：
+
+| 场景 | 现成来源 |
+| --- | --- |
+| UTF-16LE | PowerShell 5.1 的 `>` / `Out-File` / `Export-Csv` 默认编码 |
+| UTF-16（OLE 复合文档） | 旧式 `.xls` / `.doc` |
+| GBK / GB18030 | 中文 Excel「另存为 CSV」 |
+
+docx/xlsx 这类 OOXML 走 zip 解包；判定不出编码的二进制（既不是合法 UTF-8、也没有 UTF-16 的零字节特征）会三种解码都扫一遍，宁可多一次正则。
 
 **业务数字不在检测范围内**：金额、销量、订单数、曝光、编号一律不报。
 理由：报表里数字无处不在，拦了必然逼出习惯性 `--no-verify`，防护反而失效。
@@ -79,12 +94,29 @@ git push --no-verify
 
 放行是**精确匹配**，不是模糊匹配：`allow` 里写了 `^2.某店铺-DE$`，独立的品牌词仍会被拦。
 
+注意放行的对象是**命中值**：`本地路径` 抓到的命中值是用户名，不是整条路径，
+所以写一条完整的 Windows 路径放行不生效，得直接放行那个用户名（`^USER$`）。
+
+命中值默认打码（`手机号`/`邮箱`/`疑似凭据`/`私钥`/`自定义词` 显示成 `13***78 (len=11)`），
+免得把要保护的东西又抄进 CI 日志一份；要看清全文加 `--show-values`：
+
+```bash
+python ~/.git-guard/scan.py --staged --show-values
+```
+
 ### 边界
 
 - **只拦 commit 和 push，不拦 `git add`**。add 只是暂存，不落历史。
-- **找不到 python 时警告并放行**，不会把你锁死在外面。
+- **找不到 python，或 `python` 是 Microsoft Store 的占位存根时，警告并放行**，不会把你锁死在外面。
 - **编辑器/IDE 的 Git 面板同样触发**（VSCode 等底层调用同一个 `git` 二进制）。少数用 libgit2 的旧客户端可能忽略钩子。
+- **`core.hooksPath` 会盖掉模板钩子**：husky / lefthook 项目不认 `init.templateDir`，得手动把 git-guard 接进它们的 hook 脚本。
 - 扫描器异常（exit 2）按阻断处理，避免静默失效。
+
+### 自检
+
+```bash
+python tests/run_tests.py        # 16 条回归用例，只用标准库
+```
 
 ---
 
@@ -118,24 +150,35 @@ regex:\bB0[A-Z0-9]{8}\b==>B0ASINREDACTED
 
 **顺序有意义**：先长后短。`2.某店铺-DE` 要写在 `某店铺` 前面。
 
+兜底那条正则别忘了留负向断言（`(?!ASIN\d{4,}\b|EXAMPLE\d*\b|XXXXXXXX\b)`）：
+`filter-repo` 是**先跑全部字面量、再跑正则**，裸的 `\bB0[A-Z0-9]{8}\b` 会把上面刚生成的
+`B0ASIN0001` 一起吞成 `B0ASINREDACTED`，几个不同 ASIN 抹成同一个，还不报错。
+
 ### 第 3 步：执行
 
 ```bash
 python ~/.git-guard/sanitize.py apply map.suggested.txt
 ```
 
-会先问一次（要打 `yes`），然后：
+会先问一次（要打 `yes`），然后依次：
 
-1. `git bundle create guard-backup-<时间戳>.bundle --all` 备份到仓库**上一级目录**
-2. 调 `git filter-repo --replace-text --replace-message`
-3. 打印后续手动的 force push 命令
+1. 体检：浅克隆直接拒（`--allow-shallow` 才放行）；已跟踪文件有改动就停；未跟踪文件只提示
+2. `git bundle create guard-backup-<时间戳>.bundle --all` 备份到仓库**上一级目录**，并 `git bundle verify` 验一遍能读回
+3. 调 `git filter-repo --replace-text --replace-message`
+4. **自动复扫** `--all --reflog`，把残留值列出来（别在这里就 force push）
+5. 打印后续手动的 force push 命令
 
-### 第 4 步：强推并复扫
+### 第 4 步：强推
 
 ```bash
 git remote add origin <仓库URL>    # filter-repo 会删掉 origin，防误推
 git push --force --mirror origin
-python ~/.git-guard/scan.py --all  # 复扫确认
+```
+
+第 3 步末尾已经复扫过了；想再确认一次，用真·全历史（`--all` 等价于 `--all --reflog`，会一并看其它分支和 reflog）：
+
+```bash
+python ~/.git-guard/scan.py --all
 ```
 
 ### 二进制文档（重要）
@@ -176,11 +219,14 @@ filter-repo 只能保证**从这次推送之后的所有 clone 干净**。已经
 ## 四、目录
 
 ```
-scan.py            扫描器（commit 暂存区 / 待推提交 / 全历史）
+scan.py            扫描器（commit 暂存区 / 提交信息 / 待推提交 / 全历史）
 sanitize.py        历史脱敏向导（suggest / apply）
 pre-commit         钩子：调 scan.py --staged
+commit-msg         钩子：调 scan.py --message
 pre-push           钩子：调 scan.py --ranges-stdin
 install.py         一键安装钩子到全局模板
+tests/run_tests.py 回归用例（只用标准库）
+BUGS.md            修过的漏检清单，含复现与用例对应关系
 ```
 
 本地运行时文件（**不入库**）：
@@ -193,7 +239,7 @@ install.py         一键安装钩子到全局模板
 
 ## License
 
-MIT
+MIT（见 [LICENSE](LICENSE)）
 
 ---
 
@@ -231,3 +277,14 @@ Amazon 类目 ID 形如 `(16392411031)`，11 位、以 1 开头，跟中国手�
 
 其他机器：`git fetch && git reset --hard origin/main`。
 别人 fork 的副本不受控，敏感数据若曾公开过，删库重建更彻底。
+
+---
+
+## 六、修过的漏检
+
+上面这些坑之外，还有一批**静默漏检**是后来复现出来并修掉的：`--all` 只看 HEAD 导致的假清白、
+UTF-16/GBK/OLE 三种编码整段失明、`git mv` 被判成 rename 时内容没扫、提交信息无人检查、
+`sanitize suggest` 同站点只采第一个店铺。每一条都有复现步骤和对应的回归用例：
+
+- 清单：[BUGS.md](BUGS.md)
+- 用例：`python tests/run_tests.py`
