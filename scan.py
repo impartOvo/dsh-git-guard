@@ -39,7 +39,7 @@ import subprocess
 import sys
 import zipfile
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 # 单个对象整份解码的上限；更大的对象改走「可打印串抽取」+ 头尾解码
 DEFAULT_MAX_BLOB = 32 * 1024 * 1024

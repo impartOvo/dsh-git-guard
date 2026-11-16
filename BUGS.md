@@ -376,6 +376,28 @@ bytes 对象里 —— 库里有几个大文件就是几百 MB 的峰值，比�
 
 ---
 
+### 23. 服务端钩子静默失效：挑到了 Microsoft Store 的 python 存根
+
+**症状**　`git push --no-verify` 到装了 `pre-receive` 的裸库，服务端返回
+`remote: Python was not found but can be installed from the Microsoft Store: ms-windows-store://...`，
+然后 **push 成功** —— 服务端那一层等于没装。
+
+**根因**　两处叠加：
+
+1. 钩子用 `command -v python3 || command -v python` 挑第一个能**找到**的解释器。
+   Windows 上 `python3` 会命中商店占位存根：存在、能执行、但不是解释器。
+2. 拿到存根后，它的退出码既不是 1 也不是 2，`pre-receive` 落到了兜底的 `exit 0`——
+   放行是对的（服务端不该被工具故障堵死），但**一个字都没说**。
+
+**修复**　四个客户端钩子 + `pre-receive` 统一改成逐个探测
+（`python3` / `python` / `py`，只认 `-c ""` 能跑起来的那个）；
+`pre-receive` 把 `rc` 分成 0 / 1 / 其它三种，其它情况在 stderr 明说
+「本次未检查就放行」。
+
+**用例**　`tests/live_hooks.py` 第 13 条（真实 push 到本地裸库）
+
+---
+
 ## 端到端验收（含 `--drop` 剔除二进制、提交信息重写、自动复扫）：
 
 ```

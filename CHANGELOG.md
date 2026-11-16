@@ -2,6 +2,21 @@
 
 版本号跟 `scan.py --version` / `sanitize.py --version` 一致。
 
+## 0.3.1
+
+落地自测（真实 `git commit` / `git push`）抓出来的两个钩子缺陷，都在 Windows 上才暴露：
+
+- **挑解释器**：`command -v python3` 在 Windows 上会命中 Microsoft Store 的占位存根
+  ——「存在、能执行、但不是解释器」。旧逻辑只探测找到的第一个，探测失败就静默放行。
+  现在四个钩子逐个试 `python3` / `python` / `py`，只认「能跑起空脚本」的那个。
+- **服务端 fail-open 太安静**：`pre-receive` 对非 0 非 1 的退出码直接 `exit 0`，
+  于是存根吐一句商店广告就把整层绕过去了。现在区分「扫描器异常」并在 stderr 明说
+  「本次未检查就放行」；同时补上同样的解释器探测。
+
+新增 `tests/live_hooks.py`：走真实 git 操作核对 15 条（提交拦截、提交信息、推送拦截、
+ref 名、`--no-verify` 留痕、基线、`path-allow`、`disable`、Office 元数据、UTF-16、
+服务端拒绝）。它需要先 `python install.py`，所以不进 CI。
+
 ## 0.3.0
 
 这一版把"能拦"往"拦得住、绕不过、可维护"推了一轮。

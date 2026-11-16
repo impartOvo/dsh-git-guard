@@ -190,8 +190,13 @@ python ~/.git-guard/scan.py --staged --show-values
 ### 自检
 
 ```bash
-python tests/run_tests.py        # 37 条回归用例，只用标准库
+python tests/run_tests.py        # 37 条：扫描器本身（临时仓库、空词表、屏蔽全局钩子）
+python tests/live_hooks.py       # 15 条：真实 commit / push，用已装好的钩子
 ```
+
+后者要 `python install.py` 装好才有效，所以不进 CI。它跑的是普通用户那条路径
+（`git init` → 提交 → 推送），顺带把 `--no-verify` 留痕、存量基线、`path-allow`、
+`disable`、Office 元数据、UTF-16 文件、服务端 `pre-receive` 都走一遍。
 
 ---
 

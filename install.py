@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUARD_HOME = os.path.join(os.path.expanduser("~"), ".git-guard")

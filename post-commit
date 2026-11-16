@@ -13,7 +13,21 @@ LOG="$GUARD_HOME/bypass.log"
 
 [ -f "$SCAN" ] || exit 0
 
-PY=$(command -v python || command -v python3 || command -v py)
+# `python3` 在 Windows 上可能是 Microsoft Store 的占位存根
+#（存在、能执行、但不是解释器）。只认「能跑起空脚本」的那一个。
+find_python() {
+  for c in python3 python py; do
+    p=$(command -v "$c" 2>/dev/null) || continue
+    [ -n "$p" ] || continue
+    if "$p" -c "" >/dev/null 2>&1; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PY=$(find_python)
 [ -n "$PY" ] || exit 0
 
 PYTHONIOENCODING=utf-8

@@ -27,7 +27,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCAN = os.path.join(HERE, "scan.py")
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 
 def sh(args, **kw):
