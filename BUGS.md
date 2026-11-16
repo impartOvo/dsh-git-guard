@@ -6,7 +6,10 @@
 复现示例里的真实值一律打码（`B0****1234`、`138****5678`、`2.某店铺-DE`），
 一是这个仓库自己也要过自己的扫描，二是别把要保护的东西抄进文档。
 
-验证：`python tests/run_tests.py` → 24/24。
+验证：`python tests/run_tests.py` → 37/37。
+
+> 0.3.0 那一轮做的主要是**能力**（存量基线、仓库级配置、凭据/PII 规则、服务端兜底、CI），
+> 不全是 bug，清单见 [CHANGELOG.md](CHANGELOG.md)。下面只记那一轮里被抓出来的**缺陷**（第 21–22 条）。
 
 ---
 
@@ -344,6 +347,32 @@ bytes 对象里 —— 库里有几个大文件就是几百 MB 的峰值，比�
 并说清只有 `--drop` 或另存为 UTF-8 两条路；`apply` 的残留提示也按这两类拆开。
 
 **用例**　`suggest_flags_nul_files_it_cannot_rewrite`
+
+---
+
+### 21. 暂存区扫描丢了统计对象，「按配置跳过」和「子模块跳过」都不再显示
+
+**症状**　`path-allow` 明明生效（文件没被拦），但输出里没有"按 path-allow 跳过 N 个路径"；
+`--staged` 下子模块提示同样消失。
+
+**根因**　`main()` 里给 `staged_texts()` 传的是**临时构造**的 stats dict，
+而 `report()` 用的是后面另外建的那个——两本账。`range_*` 路径传的是同一个对象，所以只有 `--staged` 犯病。
+
+**修复**　统计对象先建一次，两种模式共用。由 `path_allow_from_repo_config` 用例抓出来。
+
+**用例**　`path_allow_from_repo_config`
+
+### 22. 只给 `--ref` 时直接 argparse 报错
+
+**症状**　`pre-push` 在没有新提交、只有 ref 名要检查时会调 `scan.py --ref <branch>`，
+结果拿到的是"需要 --staged / --range / ..."的用法错误（exit 2），钩子把它当扫描器异常处理。
+
+**根因**　模式分发没有"只有 ref"这一支。
+
+**修复**　补上该分支（`gen = []`，随后统一追加 ref 名）；错误提示里也补了 `--ref`。
+由 `ref_name_is_scanned` 用例抓出来。
+
+**用例**　`ref_name_is_scanned`
 
 ---
 

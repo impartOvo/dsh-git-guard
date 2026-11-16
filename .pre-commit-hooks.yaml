@@ -1,0 +1,24 @@
+# pre-commit 框架接入（https://pre-commit.com）
+#
+# 用法：在你自己仓库的 .pre-commit-config.yaml 里
+#   repos:
+#     - repo: https://github.com/impartOvo/dsh-git-guard
+#       rev: <某个 commit>
+#       hooks:
+#         - id: git-guard
+#         - id: git-guard-commit-msg
+#
+# 注意：这条路径不需要 install.py，也不会改你的全局 git 配置；
+# 反过来，它只在 pre-commit 跑的时候生效，git commit --no-verify 一样能绕过。
+- id: git-guard
+  name: git-guard（暂存区）
+  entry: python scan.py --staged
+  language: system
+  pass_filenames: false
+  always_run: true
+
+- id: git-guard-commit-msg
+  name: git-guard（提交信息）
+  entry: python scan.py --message
+  language: system
+  stages: [commit-msg]

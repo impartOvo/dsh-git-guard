@@ -1,0 +1,42 @@
+name: guard
+
+# 客户端钩子可以被 --no-verify 关掉，CI 这一层不能。
+# 顺带把三平台矩阵跑起来：钩子是 sh 脚本，POSIX 行为和 Windows 上不一样。
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: git 身份（用例里要提交）
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name ci
+      - name: 回归用例
+        run: python tests/run_tests.py
+
+  self-check:
+    name: 本仓库自检（不能带着敏感数据）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 全历史扫描
+        run: python scan.py --all
