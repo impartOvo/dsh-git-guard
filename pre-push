@@ -53,17 +53,26 @@ if [ -z "$EXPR" ] && [ -z "$REFS" ]; then
   exit 0
 fi
 
-COMMITS=$(printf '%s' "$EXPR" | tr '\n' ' ')
+COMMITS=""
+if [ -n "$EXPR" ]; then
+  # 用 while read 拼成空格分隔，避免依赖 tr
+  while IFS= read -r line; do
+    [ -n "$line" ] && COMMITS="$COMMITS $line"
+  done <<EOF
+$EXPR
+EOF
+fi
 COUNT=0
 if [ -n "$COMMITS" ]; then
-  COUNT=$(git rev-list $COMMITS 2>/dev/null | wc -l | tr -d ' ')
+  # shellcheck disable=SC2086
+  COUNT=$(git rev-list --count $COMMITS 2>/dev/null || echo 0)
 fi
 
 if [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then
   # 没有新提交，但 ref 名还是要看一眼
   if [ -n "$REFS" ]; then
     # shellcheck disable=SC2086
-    "$PY" "$SCAN" --ref $REFS
+    "$PY" "$SCAN" $REFS
     exit $?
   fi
   exit 0
