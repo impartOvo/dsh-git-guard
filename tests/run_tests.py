@@ -453,7 +453,225 @@ def oversized_blob_tail_is_scanned(tmp):
     rc, out = scan(repo, "--staged", env_extra={"GIT_GUARD_MAX_BLOB": str(1024 * 1024)})
     assert rc == 1, "超大对象的尾部没有被扫描：\n" + out
     assert "ASIN" in out, out
-    assert "只扫了头尾" in out, "覆盖不足必须如实报出来：\n" + out
+    assert "可打印串抽取" in out, "覆盖不足必须如实报出来：\n" + out
+    return out
+
+
+@test
+def baseline_downgrades_existing_hits(tmp):
+    """存量记成基线后只提示不阻断，新增值照拦"""
+    repo = new_repo(tmp)
+    write(os.path.join(repo, "old.txt"), ASIN + "\n")
+    add_commit(repo, None, "legacy")
+    r = sh([PY, SCAN, "--all", "--write-baseline"], repo)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    assert os.path.isfile(os.path.join(repo, ".git", "guard-baseline.txt"))
+    # 同一个值再出现：降级为存量
+    write(os.path.join(repo, "old2.txt"), ASIN + "\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 0, "存量值不该再阻断：\n" + out
+    assert "基线" in out, out
+    # 新值照拦
+    write(os.path.join(repo, "new.txt"), ASIN2 + "\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, "新增值必须照拦：\n" + out
+    assert ASIN2 in out, out
+    return out
+
+
+@test
+def path_allow_from_repo_config(tmp):
+    """path-allow 让某个目录整体不参与扫描"""
+    repo = new_repo(tmp)
+    write(os.path.join(repo, ".git-guard.conf"), "path-allow: vendor/**\n")
+    write(os.path.join(repo, "vendor", "x.txt"), ASIN + "\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 0, "path-allow 没生效：\n" + out
+    assert "path-allow" in out, out
+    return out
+
+
+@test
+def term_from_local_repo_config(tmp):
+    """仓库本地配置里的 term 生效（.git/guard.conf 不会入库）"""
+    repo = new_repo(tmp)
+    word = _s("品牌", "乙")
+    write(os.path.join(repo, ".git", "guard.conf"), "term: %s\n" % word)
+    write(os.path.join(repo, "a.txt"), "说明 " + word + "\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, "仓库级词表没生效：\n" + out
+    assert "自定义词" in out, out
+    assert word not in out, "打码失败：\n" + out
+    return out
+
+
+@test
+def disable_check_from_config(tmp):
+    """disable 关掉某一类检查，其余照旧"""
+    repo = new_repo(tmp)
+    write(os.path.join(repo, ".git-guard.conf"), "disable: 手机号\n")
+    write(os.path.join(repo, "a.txt"), PHONE + "\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 0, out
+    assert "已按配置关掉" in out, out
+    write(os.path.join(repo, "b.txt"), ASIN + "\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, "只该关掉手机号那一类：\n" + out
+    assert "ASIN" in out and "[手机号]" not in out, out
+    return out
+
+
+@test
+def credential_shapes_are_caught(tmp):
+    """常见凭据形态：GitHub token、AWS key id"""
+    repo = new_repo(tmp)
+    gh = "gh" + "p_" + "a" * 36
+    aws = "AKIA" + "Q" * 16
+    write(os.path.join(repo, "a.env"), "T=%s\nK=%s\n" % (gh, aws))
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, out
+    assert "疑似凭据" in out, out
+    return out
+
+
+@test
+def cn_id_checksum_decides(tmp):
+    """身份证要算校验位：格式对但校验位不对的不报"""
+    repo = new_repo(tmp)
+    good = "110105" + "19491231" + "002X"
+    bad = "110105" + "19491231" + "0021"
+    write(os.path.join(repo, "bad.txt"), bad + "\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 0, "校验位不对的不该报：\n" + out
+    write(os.path.join(repo, "good.txt"), good + "\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, "合法身份证要报：\n" + out
+    assert "身份证" in out, out
+    return out
+
+
+@test
+def bank_card_needs_luhn(tmp):
+    """银行卡号走 Luhn，过不了的当业务数字放行"""
+    repo = new_repo(tmp)
+    no_card = _s("4411", "1111", "1111", "1112")
+    yes_card = _s("4111", "1111", "1111", "1111")
+    write(os.path.join(repo, "no.txt"), no_card + "\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 0, "Luhn 不通的不该报：\n" + out
+    write(os.path.join(repo, "yes.txt"), yes_card + "\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, out
+    assert "银行卡" in out, out
+    return out
+
+
+@test
+def office_metadata_is_reported(tmp):
+    """docx 的作者 / 最后修改人是真名要报，Office 默认值不报"""
+    repo = new_repo(tmp)
+
+    def make(path, creator):
+        z = zipfile.ZipFile(path, "w")
+        z.writestr("[Content_Types].xml", "<Types/>")
+        z.writestr("word/document.xml", "<w/>")
+        z.writestr("docProps/core.xml",
+                   '<cp:coreProperties><dc:creator>%s</dc:creator>'
+                   '<cp:lastModifiedBy>%s</cp:lastModifiedBy></cp:coreProperties>'
+                   % (creator, creator))
+        z.close()
+
+    make(os.path.join(repo, "default.docx"), "Microsoft Office User")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 0, "Office 默认作者不该报：\n" + out
+    name = _s("张", "三")
+    make(os.path.join(repo, "real.docx"), name)
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, "真实姓名的元数据要报：\n" + out
+    assert "Office元数据" in out, out
+    assert name not in out, "姓名要打码：\n" + out
+    return out
+
+
+@test
+def ref_name_is_scanned(tmp):
+    """分支名/tag 名也会泄露"""
+    repo = new_repo(tmp)
+    write(os.path.join(repo, "a.txt"), "# clean\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--ref", "refs/heads/" + STORE_DE + "-fix")
+    assert rc == 1, "分支名没被扫：\n" + out
+    assert "店铺名" in out, out
+    return out
+
+
+@test
+def internal_submodule_url_is_scanned(tmp):
+    """.gitmodules 里的内网地址要报"""
+    repo = new_repo(tmp)
+    write(os.path.join(repo, ".gitmodules"),
+          '[submodule "x"]\n\tpath = x\n\turl = http://10.0.0.5/x.git\n')
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, out
+    assert "子模块地址" in out, out
+    return out
+
+
+@test
+def large_blob_uses_runs_and_stays_fast(tmp):
+    """8MB 对象走可打印串抽取：中间段能覆盖到，且不该慢"""
+    repo = new_repo(tmp)
+    write_bytes(os.path.join(repo, "mid.bin"),
+                b"\x00" * (4 * 1024 * 1024) + ("mid " + ASIN + " tail").encode()
+                + b"\x00" * (4 * 1024 * 1024))
+    sh(["git", "add", "-A"], repo)
+    t = time.time()
+    rc, out = scan(repo, "--staged")
+    d = time.time() - t
+    assert rc == 1, "8MB 对象中间段没扫到：\n" + out
+    assert d < 15, "大对象太慢：%.1fs" % d
+    return "%.2fs" % d
+
+
+@test
+def commit_mode_scans_message_and_tree(tmp):
+    """post-commit 用的单提交模式：内容 + 提交信息都要看"""
+    repo = new_repo(tmp)
+    write(os.path.join(repo, "a.txt"), "# clean\n")
+    sh(["git", "add", "-A"], repo)
+    sh(["git", "commit", "-q", "--no-verify", "-m", "出货 " + PHONE], repo)
+    rc, out = scan(repo, "--commit", "HEAD")
+    assert rc == 1, out
+    assert "手机号" in out and "<commit message>" in out, out
+    return out
+
+
+@test
+def server_stdin_scans_incoming(tmp):
+    """pre-receive 协议：<old> <new> <ref>"""
+    repo = new_repo(tmp)
+    base = sh(["git", "rev-parse", "HEAD"], repo).stdout.decode().strip()
+    write(os.path.join(repo, "a.txt"), ASIN + "\n")
+    add_commit(repo, None, "incoming")
+    head = sh(["git", "rev-parse", "HEAD"], repo).stdout.decode().strip()
+    rc, out = scan(repo, "--server-stdin",
+                   input_bytes=("%s %s refs/heads/main\n" % (base, head)).encode())
+    assert rc == 1, "服务端扫描没看到新提交：\n" + out
+    assert "ASIN" in out, out
     return out
 
 
