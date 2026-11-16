@@ -25,7 +25,7 @@ def main():
     print("  ✓ 扫描器 -> %s" % GUARD_HOME)
 
     # 2) 钩子
-    for h in ("pre-commit", "pre-push"):
+    for h in ("pre-commit", "pre-push", "commit-msg"):
         dst = os.path.join(HOOKS, h)
         shutil.copy2(os.path.join(HERE, h), dst)
         try:
@@ -35,8 +35,28 @@ def main():
         print("  ✓ 钩子 -> %s" % dst)
 
     # 3) 全局模板
+    old = subprocess.run(["git", "config", "--global", "--get", "init.templateDir"],
+                         capture_output=True, text=True).stdout.strip()
+    if old and os.path.abspath(old) != os.path.abspath(TEMPLATE):
+        print("  ⚠ 已有 init.templateDir = %s，将被覆盖（原来的模板里的钩子不再生效）" % old)
     subprocess.run(["git", "config", "--global", "init.templateDir", TEMPLATE])
     print("  ✓ init.templateDir = %s" % TEMPLATE)
+
+    # 3b) husky / lefthook 这类项目会设置 core.hooksPath，模板钩子根本不跑
+    hp = subprocess.run(["git", "config", "--global", "--get", "core.hooksPath"],
+                        capture_output=True, text=True).stdout.strip()
+    if hp:
+        print("  ⚠ 检测到 core.hooksPath = %s（husky/lefthook 常用）：" % hp)
+        print("    设置了它之后 init.templateDir 里的钩子不会被调用，"
+              "这些项目需要手动把 git-guard 接进它们的 hook 脚本。")
+
+    # 3c) Windows 上 python 可能是 Microsoft Store 存根，先确认它真能跑
+    py = shutil.which("python") or shutil.which("python3") or shutil.which("py")
+    if not py:
+        print("  ⚠ 没找到 python：钩子会在每次 commit/push 时提示跳过检查。")
+    elif subprocess.run([py, "-c", ""], capture_output=True).returncode != 0:
+        print("  ⚠ %s 不能执行 Python（可能是 Microsoft Store 占位存根），钩子会跳过检查。" % py)
+
 
     # 4) 词表模板（已存在则不动）
     terms = os.path.join(GUARD_HOME, "terms.txt")
@@ -60,6 +80,7 @@ def main():
     print("  · 已有仓库补装：")
     print("      cp %s/pre-commit .git/hooks/" % HOOKS)
     print("      cp %s/pre-push   .git/hooks/" % HOOKS)
+    print("      cp %s/commit-msg .git/hooks/" % HOOKS)
     print("  · 自检： python %s --all" % os.path.join(GUARD_HOME, "scan.py"))
     return 0
 

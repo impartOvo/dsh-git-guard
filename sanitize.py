@@ -80,6 +80,16 @@ def collect_all_texts():
         yield (path or sha), text, data[:2] == b"PK"
 
 
+def _label(i):
+    """1→A … 26→Z，27→AA。保证占位符单射，不撞名。"""
+    s, i = "", i - 1
+    while True:
+        s = chr(65 + i % 26) + s
+        i = i // 26 - 1
+        if i < 0:
+            return s
+
+
 def cmd_suggest(args):
     if sh(["git", "rev-parse", "--verify", "HEAD"]).returncode != 0:
         die("当前目录不是 git 仓库，或没有任何提交")
@@ -92,9 +102,11 @@ def cmd_suggest(args):
         for m in ASIN.findall(text):
             if not re.match(r"^B0(ASIN\d{4}|EXAMPLE\d*|XXXXXXXX)$", m) and m not in asins:
                 asins.append(m)
-        for m in SHOP.findall(text):
-            full = re.search(r"\d+\.[\u4e00-\u9fa5]{2,}-" + m, text)
-            v = full.group(0) if full else m
+        for m in SHOP.finditer(text):
+            # 旧版用 SHOP.findall()：正则带一个分组，findall 只返回站点码（DE/FR…），
+            # 再 re.search 回查全文第一个同站点店铺 —— 同一文件里第二个同站点店铺
+            # 永远进不了草稿，于是「扫描器拦、清洗器漏」，历史洗不干净。
+            v = m.group(0)
             if not v.startswith(("店铺A", "店铺B")) and v not in shops:
                 shops.append(v)
         for m in MAIL.findall(text):
@@ -107,7 +119,9 @@ def cmd_suggest(args):
     if shops:
         lines.append("# ---- 店铺名 ----")
         for i, s in enumerate(shops, 1):
-            lines.append("%s==>店铺%s-%s" % (s, chr(64 + (i % 26) + 1), s.rsplit("-", 1)[-1]))
+            # 旧版 chr(64 + (i % 26) + 1)：第 1 个是 B（不是 A），第 26 个又回到 A，
+            # 第 27 个与第 1 个撞名 —— 两个真实店铺映射到同一占位符，映射不再单射。
+            lines.append("%s==>店铺%s-%s" % (s, _label(i), s.rsplit("-", 1)[-1]))
         lines.append("")
     if asins:
         lines.append("# ---- ASIN ----")
@@ -120,7 +134,10 @@ def cmd_suggest(args):
             lines.append("%s==>contact%d@example.com" % (m, i))
         lines.append("")
     lines.append("# ---- 兜底：漏网 ASIN（正则） ----")
-    lines.append("regex:\\bB0[A-Z0-9]{8}\\b==>B0ASINREDACTED")
+    # 旧版是 regex:\bB0[A-Z0-9]{8}\b==>B0ASINREDACTED。
+    # filter-repo 先跑字面量、再跑正则，于是这条兜底会把上面刚生成的
+    # B0ASIN0001 / B0EXAMPLE1 一起吃成 B0ASINREDACTED —— 精心做的映射全被抹平。
+    lines.append("regex:\\bB0(?!ASIN\\d{4,}\\b|EXAMPLE\\d*\\b|XXXXXXXX\\b)[A-Z0-9]{8}\\b==>B0ASINREDACTED")
 
     out = args.output or "map.suggested.txt"
     with open(out, "w", encoding="utf-8") as f:
@@ -178,12 +195,40 @@ def cmd_apply(args):
             print("[apply] 已取消，未做任何改动。")
             return 0
 
+    # 前置体检：任何一项不满足就停，别把仓库带进半重写的状态
+    # 1) 浅克隆：filter-repo 会按看到的片段重写，历史直接残缺
+    if os.path.exists(os.path.join(repo, ".git", "shallow")) and not args.allow_shallow:
+        die("这是浅克隆（.git/shallow 存在），重写只会产出残缺历史。\n"
+            "  先 git fetch --unshallow，或加 --allow-shallow 自担风险。")
+    # 2) 工作区：已跟踪文件有改动 -> 停（重写会把它们冲掉）；
+    #    只有未跟踪文件 -> 只提示（filter-repo 不碰未跟踪文件，
+    #    而 suggest 生成的 map.txt 就躺在仓库里，不能因此把自己卡死）
+    status = sh(["git", "status", "--porcelain"]).stdout.splitlines()
+    tracked = [l for l in status if not l.startswith("??")]
+    untracked = [l[3:] for l in status if l.startswith("??")]
+    if tracked and not args.force:
+        die("工作区有未提交改动，先提交/stash 再清洗：\n" + "\n".join(tracked[:20]))
+    skip = os.path.abspath(mapfile)
+    untracked = [p for p in untracked if os.path.abspath(p) != skip]
+    if untracked:
+        print("\n[apply] · 有 %d 个未跟踪文件（不会被重写影响，也不进备份）：%s"
+              % (len(untracked), ", ".join(untracked[:5])))
+    # 3) stash 里可能有真实数据，bundle --all 保不住它们
+    stashes = sh(["git", "stash", "list"]).stdout.strip()
+    if stashes:
+        print("\n[apply] ⚠ stash 里有 %d 条记录，bundle --all 不包含 stash；"
+              "重写后它们会变成悬空提交。" % len(stashes.splitlines()))
+
     # 备份
     print("\n[apply] 备份到 %s" % bundle)
     r = sh(["git", "bundle", "create", bundle, "--all"])
     if r.returncode != 0:
         die("备份失败，已中止：\n" + r.stderr)
-    print("[apply] 备份完成")
+    # 备份是这条路上唯一的安全网，必须验证它真能读回来
+    v = sh(["git", "bundle", "verify", bundle])
+    if v.returncode != 0:
+        die("备份包校验失败，已中止：\n" + (v.stderr or v.stdout))
+    print("[apply] 备份完成并校验通过")
 
     # 规则落盘（filter-repo 需要文件路径）
     rules_path = os.path.join(repo, ".git", "guard-rules.txt")
@@ -205,6 +250,15 @@ def cmd_apply(args):
         die("filter-repo 失败。可用备份恢复：\n  git clone %s <新目录>" % bundle)
 
     os.remove(rules_path)
+
+    # 重写完立刻自证：旧流程靠人手敲 scan.py --all，而那个 --all 只看 HEAD，
+    # 于是「洗完了」常常是假象。这里自动跑一次真·全历史（--all --reflog）。
+    print("\n[apply] 复扫全历史（--all --reflog）...")
+    v = sh([sys.executable, SCAN, "--all"])
+    print(v.stdout.rstrip())
+    if v.returncode != 0:
+        print("\n[apply] ⚠ 仍有残留命中，别急着重推。"
+              "把上面列出的值补进映射文件，再 apply 一次（幂等）。")
 
     print("\n[apply] 历史已重写。下一步（手动）：")
     print("  1) git remote add origin <你的仓库URL>    # filter-repo 会删掉 origin")
@@ -232,6 +286,10 @@ def main():
         ap.add_argument("--yes", "-y", action="store_true")
         ap.add_argument("--drop", nargs="*", default=[],
                         help="额外从历史剔除的路径（二进制文档请放这里）")
+        ap.add_argument("--allow-shallow", action="store_true",
+                        help="浅克隆也继续（历史会残缺，慎用）")
+        ap.add_argument("--force", action="store_true",
+                        help="工作区有未提交改动也继续")
         return cmd_apply(ap.parse_args(sys.argv[2:]))
     print("未知子命令: " + sub)
     print(__doc__)

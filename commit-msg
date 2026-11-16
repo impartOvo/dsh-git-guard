@@ -1,0 +1,28 @@
+#!/bin/sh
+# git-guard commit-msg：提交前扫描提交信息
+# 一条 -m "2.某店铺-DE 出货 138****5678" 就已经把标识写进历史，
+# 而 pre-commit 只看暂存区内容，永远看不到它。
+# 绕过：git commit --no-verify
+
+GUARD_HOME="${GIT_GUARD_HOME:-$HOME/.git-guard}"
+SCAN="$GUARD_HOME/scan.py"
+MSG="${1:-}"
+
+[ -n "$MSG" ] || exit 0
+[ -f "$SCAN" ] || exit 0
+[ -f "$MSG" ] || exit 0
+
+PY=$(command -v python || command -v python3 || command -v py)
+[ -n "$PY" ] || exit 0
+
+PYTHONIOENCODING=utf-8
+PYTHONUTF8=1
+export PYTHONIOENCODING PYTHONUTF8
+
+"$PY" "$SCAN" --message "$MSG"
+rc=$?
+if [ $rc -eq 2 ]; then
+  echo "[git-guard] 扫描器异常（exit 2）。如确需提交：git commit --no-verify"
+  exit 1
+fi
+exit $rc

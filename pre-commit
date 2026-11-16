@@ -16,6 +16,18 @@ if [ -z "$PY" ]; then
   exit 0
 fi
 
+# Windows 上 python 可能是 Microsoft Store 的占位存根：存在、能执行、但没有解释器。
+if ! "$PY" -c "" >/dev/null 2>&1; then
+  echo "[git-guard] 警告：$PY 不是可用的 Python 解释器，提交前检查未执行。"
+  exit 0
+fi
+
+# 输出重定向到文件/CI 日志时，中文与 ✓ 在 cp936 下会抛 UnicodeEncodeError，
+# 那会被当成 exit 2 从而锁死提交。这里固定 UTF-8 输出。
+PYTHONIOENCODING=utf-8
+PYTHONUTF8=1
+export PYTHONIOENCODING PYTHONUTF8
+
 "$PY" "$SCAN" --staged
 rc=$?
 if [ $rc -eq 2 ]; then
