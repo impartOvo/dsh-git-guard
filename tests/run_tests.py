@@ -340,6 +340,123 @@ def full_history_is_fast(tmp):
     return "200 objects in %.2fs" % d
 
 
+@test
+def nul_heavy_binary_ascii_run_is_scanned(tmp):
+    """零字节占主导的文件（稀疏/补齐的二进制）里夹着的 ASCII 文本不能丢"""
+    repo = new_repo(tmp)
+    write_bytes(os.path.join(repo, "pad.bin"),
+                b"\x00" * 65536 + ("needle " + ASIN + " tail").encode())
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, "零字节多的文件被当成纯 UTF-16 解，ASCII 段落全部失明：\n" + out
+    assert "ASIN" in out, out
+    return out
+
+
+@test
+def ole_compressed_8bit_string_is_scanned(tmp):
+    """BIFF8 的 8 位压缩字符串也要能看到（不能只解 UTF-16）"""
+    repo = new_repo(tmp)
+    body = b"\x00" * 40 + b"SST " + ASIN.encode("ascii")
+    write_bytes(os.path.join(repo, "old.xls"),
+                b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + body)
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, "OLE 里的 8 位串没扫到：\n" + out
+    assert "ASIN" in out, out
+    return out
+
+
+@test
+def identical_blobs_report_every_path(tmp):
+    """同一份内容挂在多个路径上时，不能只报最后一个"""
+    repo = new_repo(tmp)
+    write(os.path.join(repo, "a.txt"), ASIN + "\n")
+    shutil.copyfile(os.path.join(repo, "a.txt"), os.path.join(repo, "b.txt"))
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged")
+    assert rc == 1, out
+    assert "a.txt" in out and "b.txt" in out, "只报了一个路径：\n" + out
+    return out
+
+
+@test
+def custom_term_is_not_leaked_in_label(tmp):
+    """自定义词打码时，分类标签不能把明文又印出来"""
+    repo = new_repo(tmp)
+    word = _s("品牌", "甲")
+    terms = os.path.join(repo, ".terms")
+    write(terms, word + "\n")
+    write(os.path.join(repo, "a.txt"), "说明里提到 " + word + " 这个词\n")
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged", env_extra={"GIT_GUARD_TERMS": terms})
+    assert rc == 1, out
+    assert word not in out, "标签把自定义词明文带出来了：\n" + out
+    rc, out2 = scan(repo, "--staged", "--show-values",
+                    env_extra={"GIT_GUARD_TERMS": terms})
+    assert word in out2, "--show-values 应给出明文：\n" + out2
+    return out
+
+
+@test
+def suggest_reads_utf16_history(tmp):
+    """suggest 的解码必须和 scan 一致，否则草稿漏项、洗完复扫还是红"""
+    repo = new_repo(tmp)
+    write_bytes(os.path.join(repo, "u16.txt"),
+                b"\xff\xfe" + ("订单 %s\n" % ASIN).encode("utf-16-le"))
+    add_commit(repo, None, "data")
+    out_map = os.path.join(repo, "map.txt")
+    r = sh([PY, SANITIZE, "suggest", "--output", out_map], repo)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    text = io.open(out_map, encoding="utf-8").read()
+    assert ASIN in text, "UTF-16 历史文件里的 ASIN 没进草稿：\n" + text
+    return text
+
+
+@test
+def suggest_emits_phone_lines(tmp):
+    """suggest 要覆盖手机号（否则清完复扫仍被拦，得靠人手补）"""
+    repo = new_repo(tmp)
+    write(os.path.join(repo, "a.txt"), ("联系电话 %s\n" % PHONE))
+    add_commit(repo, None, "data")
+    out_map = os.path.join(repo, "map.txt")
+    r = sh([PY, SANITIZE, "suggest", "--output", out_map], repo)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    text = io.open(out_map, encoding="utf-8").read()
+    assert PHONE in text and "PHONE_C" in text, "草稿里没有手机号映射：\n" + text
+    return text
+
+
+@test
+def suggest_flags_nul_files_it_cannot_rewrite(tmp):
+    """含 NUL 的 blob（含 UTF-16 文本）filter-repo 替换不动，suggest 必须提前点名"""
+    repo = new_repo(tmp)
+    write_bytes(os.path.join(repo, "u16.txt"),
+                b"\xff\xfe" + ("订单 %s\n" % STORE_FR).encode("utf-16-le"))
+    add_commit(repo, None, "data")
+    out_map = os.path.join(repo, "map.txt")
+    r = sh([PY, SANITIZE, "suggest", "--output", out_map], repo)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    out = r.stdout.decode("utf-8", "replace")
+    assert "u16.txt" in out, "没点名那个替换不动的文件：\n" + out
+    assert "补映射也没用" in out, out
+    return out
+
+
+@test
+def oversized_blob_tail_is_scanned(tmp):
+    """超大对象只扫头段时，末尾的内容会被整段漏掉；尾部必须一起看，并如实报覆盖不足"""
+    repo = new_repo(tmp)
+    write_bytes(os.path.join(repo, "pad.bin"),
+                b"\x00" * (4 * 1024 * 1024) + ("tail " + ASIN).encode())
+    sh(["git", "add", "-A"], repo)
+    rc, out = scan(repo, "--staged", env_extra={"GIT_GUARD_MAX_BLOB": str(1024 * 1024)})
+    assert rc == 1, "超大对象的尾部没有被扫描：\n" + out
+    assert "ASIN" in out, out
+    assert "只扫了头尾" in out, "覆盖不足必须如实报出来：\n" + out
+    return out
+
+
 # ---------------------------------------------------------------- runner
 
 def main(argv):

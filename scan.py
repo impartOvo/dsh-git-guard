@@ -28,6 +28,9 @@ __version__ = "0.2.0"
 
 # 单个对象参与解码的字节上限；超出部分只做 UTF-8 前段扫描并记为覆盖不足
 MAX_BLOB_BYTES = int(os.environ.get("GIT_GUARD_MAX_BLOB", 32 * 1024 * 1024))
+# 超限时保留尾部这一截：补齐/sparse 的大文件里，真正的内容常常压在末尾，
+# 只留头段等于把「最后一个字节里的东西」全漏掉。
+TAIL_KEEP = 2 * 1024 * 1024
 
 GENERIC = {
     "ASIN": re.compile(r"\bB0[A-Z0-9]{8}\b"),
@@ -99,17 +102,21 @@ def decode_all(data):
     if data[:3] == b"\xef\xbb\xbf":
         return [data[3:].decode("utf-8", "ignore")]
 
-    # OLE 复合文档（.xls/.doc/.ppt）：正文是 UTF-16LE，且紧跟在 512 字节扇区头之后；
-    # 两种对齐都试，避免正文起点是奇数偏移时整体错位成乱码。
+    # OLE 复合文档（.xls/.doc/.ppt）：BIFF8 的字符串有 UTF-16 也有 8 位压缩形态，
+    # 所以 UTF-16 两种对齐 + latin-1（看 8 位串和裸 ASCII）都要扫。
     if data[:4] == OLE_MAGIC:
         return [data[8:].decode("utf-16-le", "ignore"),
-                data[9:].decode("utf-16-le", "ignore")]
+                data[9:].decode("utf-16-le", "ignore"),
+                data.decode("latin-1")]
 
     # 无 BOM 的 UTF-16：ASCII 部分每个字符都带一个 0 字节
     head = data[:8192]
     if len(head) >= 8 and head.count(0) * 8 >= len(head):
         enc = "utf-16-le" if head[1::2].count(0) >= head[0::2].count(0) else "utf-16-be"
-        return [data.decode(enc, "ignore")]
+        # 但「零字节多」也可能是稀疏文件 / 补齐过的二进制，
+        # 里面往往夹着正常的 ASCII 文本。只看 UTF-16 会把它们整段解成乱码，
+        # 于是 latin-1 这一路必须一起走。
+        return [data.decode(enc, "ignore"), data.decode("latin-1")]
 
     try:
         return [data.decode("utf-8")]
@@ -146,13 +153,16 @@ def scan_text(text, where, terms, allowres, found):
             if ok(kind, val):
                 found.setdefault(kind, {}).setdefault(val, set()).add(where)
     for t in terms:
+        # 键里不能拼词本身：那样 kind 标签会把要打码的明文又印出来
         if t in text and not any(a.search(t) for a in allowres):
-            found.setdefault("自定义词:" + t, {}).setdefault(t, set()).add(where)
+            found.setdefault("自定义词", {}).setdefault(t, set()).add(where)
 
 
 def scan_blob(data, where, terms, allowres, found, stats):
     if len(data) > MAX_BLOB_BYTES:
-        data = data[:MAX_BLOB_BYTES]
+        # 头 + 尾，中间那段不看（并如实报出来）
+        keep = max(MAX_BLOB_BYTES - TAIL_KEEP, TAIL_KEEP)
+        data = data[:keep] + b"\n" + data[-TAIL_KEEP:]
         stats["truncated"].add(where)
     for text in decode_all(data):
         scan_text(text, where, terms, allowres, found)
@@ -166,22 +176,27 @@ def batch_blobs(shas):
     """
     if not shas:
         return
-    payload = ("\n".join(shas) + "\n").encode()
-    out = subprocess.run(["git", "cat-file", "--batch"], input=payload,
-                         capture_output=True).stdout
-    i, n = 0, len(out)
-    while i < n:
-        j = out.find(b"\n", i)
-        if j < 0:
-            break
-        hdr = out[i:j].split()
-        if len(hdr) < 3:            # missing / ambiguous
-            i = j + 1
-            continue
-        sha, typ, size = hdr[0].decode(), hdr[1], int(hdr[2])
-        body = out[j + 1:j + 1 + size]
-        i = j + 1 + size + 1
-        yield sha, typ, body
+    # 分批：一次 --batch 会把整个范围的 blob 全读进内存，
+    # 碰到几个大文件就是几百 MB 的峰值。按条数切块，峰值降到「一块的量」。
+    CHUNK = 256
+    for start in range(0, len(shas), CHUNK):
+        chunk = shas[start:start + CHUNK]
+        payload = ("\n".join(chunk) + "\n").encode()
+        out = subprocess.run(["git", "cat-file", "--batch"], input=payload,
+                             capture_output=True).stdout
+        i, n = 0, len(out)
+        while i < n:
+            j = out.find(b"\n", i)
+            if j < 0:
+                break
+            hdr = out[i:j].split()
+            if len(hdr) < 3:            # missing / ambiguous
+                i = j + 1
+                continue
+            sha, typ, size = hdr[0].decode(), hdr[1], int(hdr[2])
+            body = out[j + 1:j + 1 + size]
+            i = j + 1 + size + 1
+            yield sha, typ, body
 
 
 def staged_texts(stats):
@@ -210,11 +225,14 @@ def staged_texts(stats):
         if status.startswith("D") or set(new_sha) == {"0"}:
             continue
         jobs.append((new_sha, path))
+    paths = {}
+    for sha, path in jobs:
+        paths.setdefault(sha, set()).add(path)
     for sha, typ, body in batch_blobs([s for s, _ in jobs]):
         if typ != b"blob":
             continue
-        path = dict(jobs).get(sha, sha)
-        yield path, body
+        # 同一份内容可能挂在多个路径上（复制出来的文件），全部报出来
+        yield ", ".join(sorted(paths.get(sha, {sha}))), body
 
 
 def _rev_args(range_lines):
@@ -238,11 +256,13 @@ def range_texts(range_lines):
             continue
         seen.add(sha)
         jobs.append((sha, path))
-    paths = dict(jobs)
+    paths = {}
+    for sha, path in jobs:
+        paths.setdefault(sha, set()).add(path)
     for sha, typ, body in batch_blobs([s for s, _ in jobs]):
         if typ != b"blob":
             continue
-        yield (paths.get(sha) or sha), body
+        yield ", ".join(sorted(p for p in paths.get(sha, set()) if p) or {sha}), body
 
 
 def range_messages(range_lines):
@@ -250,7 +270,8 @@ def range_messages(range_lines):
     args = ["git", "log", "--format=%H%x00%B"] + _rev_args(range_lines)
     out = subprocess.run(args, capture_output=True).stdout.decode("utf-8", "ignore")
     for chunk in out.split("\x00"):
-        if chunk.strip():
+        # 输出是「sha\0消息\0sha\0消息…」，sha 自己不是消息，别当成一条来扫
+        if chunk.strip() and not re.fullmatch(r"[0-9a-f]{40}", chunk.strip()):
             yield "<commit message>", chunk
 
 
@@ -260,20 +281,29 @@ def message_text(path):
 
 
 def mask(kind, val):
-    if kind in MASK_KINDS or kind.startswith("自定义词:"):
+    if kind in MASK_KINDS or kind == "自定义词":
         if len(val) <= 4:
             return val[0] + "***"
         return val[:2] + "***" + val[-2:] + " (len=%d)" % len(val)
     return val
 
 
+def _coverage_note(stats):
+    """覆盖不足要一直说，包括被拦住的时候 —— 否则「拦了」会被误读成「扫全了」。"""
+    out = []
+    if stats and stats["skipped"]:
+        out.append("  · 跳过 %d 个子模块指针（无内容可扫）" % len(stats["skipped"]))
+    if stats and stats["truncated"]:
+        out.append("  · %d 个对象超过 %d 字节，只扫了头尾（中间未扫）"
+                   % (len(stats["truncated"]), MAX_BLOB_BYTES))
+    return out
+
+
 def report(found, extra="", show_values=False, stats=None):
     if not found:
         print("[git-guard] \u2713 \u672a\u53d1\u73b0\u654f\u611f\u4e1a\u52a1\u6570\u636e")
-        if stats and stats["skipped"]:
-            print("  · 跳过 %d 个子模块指针（无内容可扫）" % len(stats["skipped"]))
-        if stats and stats["truncated"]:
-            print("  · %d 个对象超过 %d 字节，只扫了前段" % (len(stats["truncated"]), MAX_BLOB_BYTES))
+        for line in _coverage_note(stats):
+            print(line)
         return 0
     print("")
     print("=" * 64)
@@ -290,6 +320,8 @@ def report(found, extra="", show_values=False, stats=None):
             print("  [%s] %s   <- %s" % (kind, shown, files))
         if len(items) > 6:
             print("  [%s] ... \u53e6\u6709 %d \u4e2a" % (kind, len(items) - 6))
+    for line in _coverage_note(stats):
+        print(line)
     print("")
     print("  \u5171 %d \u4e2a\u4e0d\u540c\u503c\u547d\u4e2d\u3002%s" % (total, extra))
     print("")

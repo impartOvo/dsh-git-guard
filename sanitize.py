@@ -39,15 +39,38 @@ def die(msg, code=1):
 
 # ---------------- suggest ----------------
 
-ASIN = re.compile(r"\bB0[A-Z0-9]{8}\b")
-SHOP = re.compile(r"\d+\.[\u4e00-\u9fa5]{2,}-(DE|FR|ES|IT|UK|US|MX|CA|JP|AU|AE|SA|NL|BE|SE|PL|IE)\b")
-MAIL = re.compile(r"[\w.+-]+@[\w-]{2,}\.[\w.]{2,}")
+# 检测形态只能有一份定义：这里直接用 scan.py 的，别再抄一遍。
+# 抄一遍的后果已经发生过一次（findall 分组 bug 让同站点第二个店铺永远进不了草稿）。
+try:
+    from scan import GENERIC as _RULES, decode_all as _decode_all, batch_blobs as _batch
+except Exception:                                    # 兜底：极端情况下退化成旧行为
+    _RULES = {
+        "ASIN": re.compile(r"\bB0[A-Z0-9]{8}\b"),
+        "店铺名": re.compile(r"\d+\.[\u4e00-\u9fa5]{2,}-(?:DE|FR|ES|IT|UK|US|MX|CA|JP|AU|AE|SA|NL|BE|SE|PL|IE)\b"),
+        "邮箱": re.compile(r"[\w.+-]+@[\w-]{2,}\.[\w.]{2,}"),
+    }
+
+    def _decode_all(data):
+        return [data.decode("utf-8", "ignore")]
+
+    def _batch(shas):
+        for s in shas:
+            p = subprocess.run(["git", "cat-file", "-p", s], capture_output=True)
+            yield s, b"blob", p.stdout
+
+
+ASIN = _RULES["ASIN"]
+SHOP = _RULES["店铺名"]
+MAIL = _RULES["邮箱"]
+_PATH = re.compile(r"[A-Za-z]:[\\/]{1,2}Users[\\/]{1,2}([^\\/\s\"'<>]+)")
 
 
 def collect_all_texts():
-    """遍历全历史 blob，产出 (path, text)。二进制文档解包。"""
-    import io
-    import zipfile
+    """遍历全历史 blob，产出 (path, texts, is_binary)。
+
+    解码走 scan.py 的 decode_all：UTF-16 / OLE / GBK 的历史文件和 HEAD 一样要能读出来，
+    否则 suggest 出的草稿会漏项 —— 而漏项在清洗完成后才以「复扫还有残留」的形式暴露。
+    """
     out = sh(["git", "rev-list", "--objects", "HEAD"]).stdout
     jobs, seen = [], set()
     for line in out.splitlines():
@@ -60,24 +83,15 @@ def collect_all_texts():
         jobs.append((sha, path))
     if not jobs:
         return
-    bc = subprocess.run(["git", "cat-file", "--batch-check"],
-                        input="\n".join(s for s, _ in jobs).encode(),
-                        capture_output=True).stdout.decode("utf-8", "ignore")
-    kinds = [l.split()[1] if len(l.split()) > 1 else "?" for l in bc.splitlines()]
-    for (sha, path), k in zip(jobs, kinds):
-        if k != "blob":
+    paths = {}
+    for sha, path in jobs:
+        paths.setdefault(sha, set()).add(path)
+    for sha, typ, data in _batch([s for s, _ in jobs]):
+        if typ != b"blob":
             continue
-        data = subprocess.run(["git", "cat-file", "-p", sha], capture_output=True).stdout
-        text = data.decode("utf-8", "ignore")
-        if data[:2] == b"PK":
-            try:
-                z = zipfile.ZipFile(io.BytesIO(data))
-                parts = [n for n in z.namelist() if n.endswith((".xml", ".rels", ".txt"))]
-                if parts:
-                    text = b"\n".join(z.read(n) for n in parts).decode("utf-8", "ignore")
-            except Exception:
-                pass
-        yield (path or sha), text, data[:2] == b"PK"
+        isbin = data[:2] == b"PK" or b"\x00" in data[:8192]
+        yield ", ".join(sorted(p for p in paths.get(sha, set()) if p) or {sha}), \
+            _decode_all(data), isbin
 
 
 def _label(i):
@@ -95,23 +109,45 @@ def cmd_suggest(args):
         die("当前目录不是 git 仓库，或没有任何提交")
     print("[git-guard] 正在读取全历史，文件多时请稍候...")
 
-    asins, shops, mails, binaries = [], [], [], set()
-    for path, text, isbin in collect_all_texts():
-        if isbin and (ASIN.search(text) or MAIL.search(text)):
-            binaries.add(path)
-        for m in ASIN.findall(text):
-            if not re.match(r"^B0(ASIN\d{4}|EXAMPLE\d*|XXXXXXXX)$", m) and m not in asins:
-                asins.append(m)
-        for m in SHOP.finditer(text):
-            # 旧版用 SHOP.findall()：正则带一个分组，findall 只返回站点码（DE/FR…），
-            # 再 re.search 回查全文第一个同站点店铺 —— 同一文件里第二个同站点店铺
-            # 永远进不了草稿，于是「扫描器拦、清洗器漏」，历史洗不干净。
-            v = m.group(0)
-            if not v.startswith(("店铺A", "店铺B")) and v not in shops:
-                shops.append(v)
-        for m in MAIL.findall(text):
-            if m not in mails and "example.com" not in m:
-                mails.append(m)
+    asins, shops, mails, phones, binaries = [], [], [], [], set()
+    secrets, paths = set(), set()
+    PHONE = _RULES["手机号"]
+    KEY = _RULES["私钥"]
+    CRED = _RULES["疑似凭据"]
+    for path, texts, isbin in collect_all_texts():
+        for text in texts:
+            hit_any = False
+            for m in ASIN.finditer(text):
+                v = m.group(0)
+                if not re.match(r"^B0(ASIN\d{4}|EXAMPLE\d*|XXXXXXXX)$", v) and v not in asins:
+                    asins.append(v)
+                hit_any = True
+            for m in SHOP.finditer(text):
+                # 旧版用 SHOP.findall()：正则带一个分组，findall 只返回站点码（DE/FR…），
+                # 再 re.search 回查全文第一个同站点店铺 —— 同一文件里第二个同站点店铺
+                # 永远进不了草稿，于是「扫描器拦、清洗器漏」，历史洗不干净。
+                v = m.group(0)
+                if not v.startswith(("店铺A", "店铺B")) and v not in shops:
+                    shops.append(v)
+                hit_any = True
+            for m in MAIL.finditer(text):
+                v = m.group(0)
+                if v not in mails and "example.com" not in v:
+                    mails.append(v)
+                hit_any = True
+            for m in PHONE.finditer(text):
+                v = m.group(0)
+                if v not in phones:
+                    phones.append(v)
+                hit_any = True
+            if KEY.search(text) or CRED.search(text):
+                secrets.add(path)
+            for m in _PATH.finditer(text):
+                paths.add(m.group(1))
+            # 含 NUL 的 blob，filter-repo 的文本替换会整个跳过 —— 包括 UTF-16 文本文件。
+            # 这些文件里的值必须靠 --drop 或手工改，映射再补也替换不动。
+            if isbin and hit_any:
+                binaries.add(path)
 
     lines = ["# git-guard 映射草稿（自动生成 %s）" % time.strftime("%Y-%m-%d %H:%M:%S"),
              "# 逐行检查：改占位符名、删掉不该动的、补上漏掉的。确认后再 apply。",
@@ -133,23 +169,49 @@ def cmd_suggest(args):
         for i, m in enumerate(mails, 1):
             lines.append("%s==>contact%d@example.com" % (m, i))
         lines.append("")
+    if phones:
+        lines.append("# ---- 手机号 ----")
+        for i, p in enumerate(phones, 1):
+            lines.append("%s==>PHONE_C%d" % (p, i))
+        lines.append("")
     lines.append("# ---- 兜底：漏网 ASIN（正则） ----")
     # 旧版是 regex:\bB0[A-Z0-9]{8}\b==>B0ASINREDACTED。
     # filter-repo 先跑字面量、再跑正则，于是这条兜底会把上面刚生成的
     # B0ASIN0001 / B0EXAMPLE1 一起吃成 B0ASINREDACTED —— 精心做的映射全被抹平。
     lines.append("regex:\\bB0(?!ASIN\\d{4,}\\b|EXAMPLE\\d*\\b|XXXXXXXX\\b)[A-Z0-9]{8}\\b==>B0ASINREDACTED")
 
+    # 剩下两类不能靠占位符糊过去，单独提醒
+    if secrets:
+        lines.append("")
+        lines.append("# ⚠ 这些文件里有私钥或疑似凭据：")
+        for s in sorted(secrets)[:20]:
+            lines.append("#   " + s)
+        lines.append("#   私钥/凭据别用占位符代替 —— 先吊销轮换，再从历史剔除"
+                     "（apply --drop <path>）。")
+    if paths:
+        lines.append("")
+        lines.append("# · 本地路径里出现的用户名（要清就自己加一行 <用户名>==>USER_A，"
+                     "注意会误伤同名普通词）：")
+        for u in sorted(paths)[:10]:
+            lines.append("#   " + u)
+
     out = args.output or "map.suggested.txt"
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
     print("\n[suggest] 草稿已写入: %s" % os.path.abspath(out))
-    print("  店铺名 %d 个 / ASIN %d 个 / 邮箱 %d 个" % (len(shops), len(asins), len(mails)))
+    print("  店铺名 %d 个 / ASIN %d 个 / 邮箱 %d 个 / 手机号 %d 个"
+          % (len(shops), len(asins), len(mails), len(phones)))
+    if secrets:
+        print("  ⚠ %d 个文件含私钥或凭据：先吊销轮换，不要指望占位符" % len(secrets))
     if binaries:
-        print("\n  ⚠ 以下二进制文档含敏感内容：filter-repo 的文本替换会跳过它们。")
-        print("    建议在 apply 时对它们用 --invert-paths 剔除历史版本，再把脱敏副本作为新提交加回：")
+        print("\n  ⚠ 这些文件含敏感内容，但 filter-repo 的文本替换会跳过它们")
+        print("    （含 NUL 的 blob 一律不碰，UTF-16 文本文件同样在其中）：")
         for b in sorted(binaries):
             print("      " + b)
+        print("    这些值补映射也没用，只有两条路：")
+        print("      · apply 时用 --drop <path> 把历史版本整个剔除，再把脱敏副本作为新提交加回")
+        print("      · 或者把文件另存成 UTF-8 后重新提交，让它进入文本替换的射程")
     print("\n  下一步：人工检查 %s，然后运行" % out)
     print("    python sanitize.py apply %s" % out)
     return 0
@@ -243,13 +305,18 @@ def cmd_apply(args):
             cmd += ["--path", p]
         cmd += ["--invert-paths"]
     print("\n[apply] 执行: " + " ".join(cmd[:4]) + " ...")
-    r = sh(cmd)
-    print(r.stdout[-2000:])
-    if r.returncode != 0:
-        print(r.stderr[-2000:])
-        die("filter-repo 失败。可用备份恢复：\n  git clone %s <新目录>" % bundle)
-
-    os.remove(rules_path)
+    try:
+        r = sh(cmd)
+        print(r.stdout[-2000:])
+        if r.returncode != 0:
+            print(r.stderr[-2000:])
+            die("filter-repo 失败。可用备份恢复：\n  git clone %s <新目录>" % bundle)
+    finally:
+        # 规则文件里是明文真值，失败路径也必须删掉，不能留在 .git 里
+        try:
+            os.remove(rules_path)
+        except OSError:
+            pass
 
     # 重写完立刻自证：旧流程靠人手敲 scan.py --all，而那个 --all 只看 HEAD，
     # 于是「洗完了」常常是假象。这里自动跑一次真·全历史（--all --reflog）。
@@ -257,8 +324,10 @@ def cmd_apply(args):
     v = sh([sys.executable, SCAN, "--all"])
     print(v.stdout.rstrip())
     if v.returncode != 0:
-        print("\n[apply] ⚠ 仍有残留命中，别急着重推。"
-              "把上面列出的值补进映射文件，再 apply 一次（幂等）。")
+        print("\n[apply] ⚠ 仍有残留命中。两类原因别混着处理：")
+        print("    · 值本来就只在二进制 / UTF-16 文件里 —— filter-repo 替换不动，"
+              "用 --drop 或另存为 UTF-8 再提交，补映射不会收敛")
+        print("    · 值没进草稿（比如邮箱域名被 allow 掉） —— 补进映射文件再 apply，幂等")
 
     print("\n[apply] 历史已重写。下一步（手动）：")
     print("  1) git remote add origin <你的仓库URL>    # filter-repo 会删掉 origin")
