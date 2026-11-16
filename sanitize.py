@@ -27,6 +27,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCAN = os.path.join(HERE, "scan.py")
 
+__version__ = "0.3.0"
+
 
 def sh(args, **kw):
     return subprocess.run(args, capture_output=True, text=True, **kw)
@@ -42,13 +44,25 @@ def die(msg, code=1):
 # 检测形态只能有一份定义：这里直接用 scan.py 的，别再抄一遍。
 # 抄一遍的后果已经发生过一次（findall 分组 bug 让同站点第二个店铺永远进不了草稿）。
 try:
-    from scan import GENERIC as _RULES, decode_all as _decode_all, batch_blobs as _batch
+    from scan import (GENERIC as _RULES, decode_all as _decode_all,
+                      batch_blobs as _batch, load_config as _load_config,
+                      _office_meta as _office_meta,
+                      _id18_ok as _id_ok, _luhn_ok as _luhn_ok)
 except Exception:                                    # 兜底：极端情况下退化成旧行为
     _RULES = {
         "ASIN": re.compile(r"\bB0[A-Z0-9]{8}\b"),
         "店铺名": re.compile(r"\d+\.[\u4e00-\u9fa5]{2,}-(?:DE|FR|ES|IT|UK|US|MX|CA|JP|AU|AE|SA|NL|BE|SE|PL|IE)\b"),
         "邮箱": re.compile(r"[\w.+-]+@[\w-]{2,}\.[\w.]{2,}"),
+        "身份证": re.compile(r"(?<![0-9A-Za-z])[1-9]\d{16}[\dXx](?![0-9A-Za-z])"),
+        "银行卡": re.compile(r"(?<![\d.])\d{16,19}(?![\d.])"),
+        "Seller ID": re.compile(r"(?i)(?:seller[ _-]?id)['\"]?\s*[:=]\s*['\"]?(A[A-Z0-9]{12,14})\b"),
     }
+
+    def _id_ok(v):
+        return True
+
+    def _luhn_ok(v):
+        return True
 
     def _decode_all(data):
         return [data.decode("utf-8", "ignore")]
@@ -58,6 +72,17 @@ except Exception:                                    # 兜底：极端情况下�
             p = subprocess.run(["git", "cat-file", "-p", s], capture_output=True)
             yield s, b"blob", p.stdout
 
+    def _load_config(repo):
+        class _C(object):
+            terms, allow, path_allow = [], [], []
+
+            def allowres(self):
+                return []
+        return _C()
+
+    def _office_meta(data):
+        return []
+
 
 ASIN = _RULES["ASIN"]
 SHOP = _RULES["店铺名"]
@@ -66,7 +91,7 @@ _PATH = re.compile(r"[A-Za-z]:[\\/]{1,2}Users[\\/]{1,2}([^\\/\s\"'<>]+)")
 
 
 def collect_all_texts():
-    """遍历全历史 blob，产出 (path, texts, is_binary)。
+    """遍历全历史 blob，产出 (path, texts, is_binary, raw)。
 
     解码走 scan.py 的 decode_all：UTF-16 / OLE / GBK 的历史文件和 HEAD 一样要能读出来，
     否则 suggest 出的草稿会漏项 —— 而漏项在清洗完成后才以「复扫还有残留」的形式暴露。
@@ -90,8 +115,8 @@ def collect_all_texts():
         if typ != b"blob":
             continue
         isbin = data[:2] == b"PK" or b"\x00" in data[:8192]
-        yield ", ".join(sorted(p for p in paths.get(sha, set()) if p) or {sha}), \
-            _decode_all(data), isbin
+        yield (", ".join(sorted(p for p in paths.get(sha, set()) if p) or {sha}),
+               _decode_all(data), isbin, data)
 
 
 def _label(i):
@@ -110,11 +135,18 @@ def cmd_suggest(args):
     print("[git-guard] 正在读取全历史，文件多时请稍候...")
 
     asins, shops, mails, phones, binaries = [], [], [], [], set()
-    secrets, paths = set(), set()
+    ids, cards, sellers = [], [], []
+    secrets, paths, meta_files = set(), set(), set()
     PHONE = _RULES["手机号"]
     KEY = _RULES["私钥"]
     CRED = _RULES["疑似凭据"]
-    for path, texts, isbin in collect_all_texts():
+    cfg = _load_config(os.path.abspath("."))
+    allowres = cfg.allowres()
+
+    def allowed(v):
+        return any(a.search(v) for a in allowres)
+
+    for path, texts, isbin, raw in collect_all_texts():
         for text in texts:
             hit_any = False
             for m in ASIN.finditer(text):
@@ -140,6 +172,22 @@ def cmd_suggest(args):
                 if v not in phones:
                     phones.append(v)
                 hit_any = True
+            # 身份证 / 银行卡要算校验位，和扫描器同一套判定
+            for m in _RULES["身份证"].finditer(text):
+                v = m.group(0)
+                if _id_ok(v) and v not in ids:
+                    ids.append(v)
+                hit_any = hit_any or _id_ok(v)
+            for m in _RULES["银行卡"].finditer(text):
+                v = m.group(0)
+                if _luhn_ok(v) and v not in cards:
+                    cards.append(v)
+                hit_any = hit_any or _luhn_ok(v)
+            for m in _RULES["Seller ID"].finditer(text):
+                v = m.group(1)
+                if v not in sellers:
+                    sellers.append(v)
+                hit_any = True
             if KEY.search(text) or CRED.search(text):
                 secrets.add(path)
             for m in _PATH.finditer(text):
@@ -148,6 +196,12 @@ def cmd_suggest(args):
             # 这些文件里的值必须靠 --drop 或手工改，映射再补也替换不动。
             if isbin and hit_any:
                 binaries.add(path)
+        # Office 元数据在 zip 里，filter-repo 同样替换不动
+        if raw[:2] == b"PK" and _office_meta(raw):
+            meta_files.add(path)
+
+    for name, lst in (("身份证", ids), ("银行卡", cards), ("Seller ID", sellers)):
+        lst[:] = [v for v in lst if not allowed(v)]
 
     lines = ["# git-guard 映射草稿（自动生成 %s）" % time.strftime("%Y-%m-%d %H:%M:%S"),
              "# 逐行检查：改占位符名、删掉不该动的、补上漏掉的。确认后再 apply。",
@@ -174,6 +228,21 @@ def cmd_suggest(args):
         for i, p in enumerate(phones, 1):
             lines.append("%s==>PHONE_C%d" % (p, i))
         lines.append("")
+    if ids:
+        lines.append("# ---- 身份证 ----")
+        for i, v in enumerate(ids, 1):
+            lines.append("%s==>ID_C%d" % (v, i))
+        lines.append("")
+    if cards:
+        lines.append("# ---- 银行卡 ----")
+        for i, v in enumerate(cards, 1):
+            lines.append("%s==>CARD_C%d" % (v, i))
+        lines.append("")
+    if sellers:
+        lines.append("# ---- Seller ID / Merchant Token（标签一起替换） ----")
+        for i, v in enumerate(sellers, 1):
+            lines.append("%s==>SELLER_C%d" % (v, i))
+        lines.append("")
     lines.append("# ---- 兜底：漏网 ASIN（正则） ----")
     # 旧版是 regex:\bB0[A-Z0-9]{8}\b==>B0ASINREDACTED。
     # filter-repo 先跑字面量、再跑正则，于是这条兜底会把上面刚生成的
@@ -194,16 +263,26 @@ def cmd_suggest(args):
                      "注意会误伤同名普通词）：")
         for u in sorted(paths)[:10]:
             lines.append("#   " + u)
+    if meta_files:
+        lines.append("")
+        lines.append("# ⚠ 这些 Office 文档的内嵌元数据里有真实姓名/公司名：")
+        for f in sorted(meta_files)[:20]:
+            lines.append("#   " + f)
+        lines.append("#   元数据在 zip 里，filter-repo 替换不动 —— 改文件属性后另存，"
+                     "再作为新提交加回（或 apply --drop <path>）。")
 
     out = args.output or "map.suggested.txt"
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
     print("\n[suggest] 草稿已写入: %s" % os.path.abspath(out))
-    print("  店铺名 %d 个 / ASIN %d 个 / 邮箱 %d 个 / 手机号 %d 个"
-          % (len(shops), len(asins), len(mails), len(phones)))
+    print("  店铺名 %d / ASIN %d / 邮箱 %d / 手机号 %d / 身份证 %d / 银行卡 %d / Seller ID %d"
+          % (len(shops), len(asins), len(mails), len(phones), len(ids), len(cards), len(sellers)))
     if secrets:
         print("  ⚠ %d 个文件含私钥或凭据：先吊销轮换，不要指望占位符" % len(secrets))
+    if meta_files:
+        print("  ⚠ %d 个 Office 文档的元数据里有姓名/公司名（替换不动，需另存）"
+              % len(meta_files))
     if binaries:
         print("\n  ⚠ 这些文件含敏感内容，但 filter-repo 的文本替换会跳过它们")
         print("    （含 NUL 的 blob 一律不碰，UTF-16 文本文件同样在其中）：")
@@ -320,6 +399,14 @@ def cmd_apply(args):
 
     # 重写完立刻自证：旧流程靠人手敲 scan.py --all，而那个 --all 只看 HEAD，
     # 于是「洗完了」常常是假象。这里自动跑一次真·全历史（--all --reflog）。
+    # 基线是按值哈希记的，历史一改就全部失效，顺手删掉，免得把新值也当成存量放过。
+    baseline_path = os.path.join(repo, ".git", "guard-baseline.txt")
+    if os.path.isfile(baseline_path):
+        try:
+            os.remove(baseline_path)
+            print("\n[apply] 已清掉旧基线（历史重写后它不再对应任何内容）")
+        except OSError:
+            pass
     print("\n[apply] 复扫全历史（--all --reflog）...")
     v = sh([sys.executable, SCAN, "--all"])
     print(v.stdout.rstrip())
@@ -342,6 +429,9 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 2
+    if sys.argv[1] in ("--version", "-V", "version"):
+        print("git-guard sanitize %s" % __version__)
+        return 0
     sub = sys.argv[1]
     if sub == "suggest":
         import argparse

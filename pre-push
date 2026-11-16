@@ -1,5 +1,5 @@
 #!/bin/sh
-# git-guard pre-push：推送前扫描待推内容（含历史里尚未上传的部分）
+# git-guard pre-push：推送前扫描待推内容（含历史里尚未上传的部分、以及 ref 名）
 # 绕过：git push --no-verify
 
 GUARD_HOME="${GIT_GUARD_HOME:-$HOME/.git-guard}"
@@ -27,10 +27,15 @@ export PYTHONIOENCODING PYTHONUTF8
 
 ZERO=0000000000000000000000000000000000000000
 EXPR=""
+REFS=""
 
 # stdin 每行: <local ref> <local sha> <remote ref> <remote sha>
 while read -r lref lsha rref rsha; do
   [ -z "$lsha" ] && continue
+  # 分支名/tag 名本身也会泄露（store-2.某店铺-DE-fix 这种）
+  case "$lref" in
+    refs/heads/*|refs/tags/*) REFS="$REFS --ref $lref" ;;
+  esac
   case "$lsha" in
     "$ZERO") continue ;;
   esac
@@ -44,18 +49,29 @@ while read -r lref lsha rref rsha; do
   fi
 done
 
-if [ -z "$EXPR" ]; then
+if [ -z "$EXPR" ] && [ -z "$REFS" ]; then
   exit 0
 fi
 
 COMMITS=$(printf '%s' "$EXPR" | tr '\n' ' ')
-COUNT=$(git rev-list $COMMITS 2>/dev/null | wc -l | tr -d ' ')
-case "$COUNT" in
-  0|"") exit 0 ;;
-esac
+COUNT=0
+if [ -n "$COMMITS" ]; then
+  COUNT=$(git rev-list $COMMITS 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+if [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then
+  # 没有新提交，但 ref 名还是要看一眼
+  if [ -n "$REFS" ]; then
+    # shellcheck disable=SC2086
+    "$PY" "$SCAN" --ref $REFS
+    exit $?
+  fi
+  exit 0
+fi
 
 echo "[git-guard] 待推送 $COUNT 个提交，开始扫描（文件多时需要一点时间）..."
-printf '%s' "$EXPR" | "$PY" "$SCAN" --ranges-stdin
+# shellcheck disable=SC2086
+printf '%s' "$EXPR" | "$PY" "$SCAN" --ranges-stdin $REFS
 rc=$?
 if [ $rc -eq 2 ]; then
   echo "[git-guard] 扫描器异常（exit 2）。如确需推送：git push --no-verify"

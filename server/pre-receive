@@ -1,0 +1,51 @@
+#!/bin/sh
+# git-guard pre-receive —— 服务端兜底。
+#
+# 客户端钩子可以被 --no-verify 关掉、可以被没装 git-guard 的机器绕过；
+# 装在裸库上的这一层绕不过去：任何人 push 进来都要过一次。
+#
+# 部署（在服务器上的裸库仓库里）:
+#   cp server/pre-receive hooks/pre-receive && chmod +x hooks/pre-receive
+#   mkdir -p /srv/git-guard && cp scan.py /srv/git-guard/
+#   # 业务词表放服务端本地，别放进仓库:
+#   printf '某品牌名\n' > /srv/git-guard/terms.txt
+#
+# 环境变量:
+#   GIT_GUARD_HOME  扫描器目录，默认 /srv/git-guard
+#
+# 注意：服务端只做通用规则 + 服务端自己的词表；客户端 allow.txt 不生效
+#（那是有意为之——放行决定不该由推送方单方面做出）。
+
+GUARD_HOME="${GIT_GUARD_HOME:-/srv/git-guard}"
+SCAN="$GUARD_HOME/scan.py"
+
+if [ ! -f "$SCAN" ]; then
+  echo "[git-guard] 服务端未安装扫描器（$SCAN），本次 push 未检查。" >&2
+  exit 0
+fi
+
+PY=$(command -v python3 || command -v python)
+if [ -z "$PY" ]; then
+  echo "[git-guard] 服务端找不到 python，本次 push 未检查。" >&2
+  exit 0
+fi
+
+PYTHONIOENCODING=utf-8
+PYTHONUTF8=1
+export PYTHONIOENCODING PYTHONUTF8
+
+# stdin 是 pre-receive 的 ref 列表，直接交给扫描器读
+"$PY" "$SCAN" --server-stdin
+rc=$?
+if [ $rc -eq 1 ]; then
+  echo "" >&2
+  echo "[git-guard] 服务端拒绝了这次 push：上面列出的内容不允许进入本仓库。" >&2
+  echo "             清理后重新推送（历史清洗见 sanitize.py）。" >&2
+  exit 1
+fi
+if [ $rc -eq 2 ]; then
+  # 扫描器自身异常时宁可放开，避免整台服务器推不进去
+  echo "[git-guard] 服务端扫描器异常（exit 2），本次放行。" >&2
+  exit 0
+fi
+exit 0

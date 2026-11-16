@@ -1,33 +1,46 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""安装 git-guard 钩子到全局 git 模板。"""
+"""安装 git-guard 钩子到全局 git 模板。
+
+    python install.py            安装/升级
+    python install.py --version  看版本
+"""
 import os
 import shutil
 import subprocess
 import sys
 
+__version__ = "0.3.0"
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUARD_HOME = os.path.join(os.path.expanduser("~"), ".git-guard")
 TEMPLATE = os.path.join(os.path.expanduser("~"), ".git-templates")
 HOOKS = os.path.join(TEMPLATE, "hooks")
+HOOK_NAMES = ("pre-commit", "commit-msg", "pre-push", "post-commit")
 
 
 def main():
-    print("安装 git-guard")
+    if "--version" in sys.argv[1:]:
+        print("git-guard %s" % __version__)
+        return 0
+    print("安装 git-guard %s" % __version__)
     print("  脚本目录: " + HERE)
 
     os.makedirs(GUARD_HOME, exist_ok=True)
     os.makedirs(HOOKS, exist_ok=True)
 
     # 1) 扫描器
-    shutil.copy2(os.path.join(HERE, "scan.py"), os.path.join(GUARD_HOME, "scan.py"))
-    shutil.copy2(os.path.join(HERE, "sanitize.py"), os.path.join(GUARD_HOME, "sanitize.py"))
+    for f in ("scan.py", "sanitize.py"):
+        shutil.copy2(os.path.join(HERE, f), os.path.join(GUARD_HOME, f))
     print("  ✓ 扫描器 -> %s" % GUARD_HOME)
 
     # 2) 钩子
-    for h in ("pre-commit", "pre-push", "commit-msg"):
+    for h in HOOK_NAMES:
+        src = os.path.join(HERE, h)
+        if not os.path.isfile(src):
+            continue
         dst = os.path.join(HOOKS, h)
-        shutil.copy2(os.path.join(HERE, h), dst)
+        shutil.copy2(src, dst)
         try:
             os.chmod(dst, 0o755)
         except Exception:
@@ -57,7 +70,6 @@ def main():
     elif subprocess.run([py, "-c", ""], capture_output=True).returncode != 0:
         print("  ⚠ %s 不能执行 Python（可能是 Microsoft Store 占位存根），钩子会跳过检查。" % py)
 
-
     # 4) 词表模板（已存在则不动）
     terms = os.path.join(GUARD_HOME, "terms.txt")
     if not os.path.exists(terms):
@@ -78,9 +90,11 @@ def main():
     print("完成。注意：")
     print("  · 只对之后新建/新克隆的仓库自动生效")
     print("  · 已有仓库补装：")
-    print("      cp %s/pre-commit .git/hooks/" % HOOKS)
-    print("      cp %s/pre-push   .git/hooks/" % HOOKS)
-    print("      cp %s/commit-msg .git/hooks/" % HOOKS)
+    for h in HOOK_NAMES:
+        print("      cp %s/%-11s .git/hooks/" % (HOOKS, h))
+    print("  · 老仓库先把存量记成基线，否则第一次推送会被历史遗留全挡住：")
+    print("      python %s --all --write-baseline" % os.path.join(GUARD_HOME, "scan.py"))
+    print("  · 服务端兜底（客户端钩子能被关掉，这层不能）：见 server/pre-receive")
     print("  · 自检： python %s --all" % os.path.join(GUARD_HOME, "scan.py"))
     return 0
 

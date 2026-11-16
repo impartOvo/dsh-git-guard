@@ -1,0 +1,47 @@
+#!/bin/sh
+# git-guard post-commit：提交之后补一遍，专门抓「绕过 pre-commit」这件事。
+#
+# 它永远 exit 0 —— 提交已经落地，这里不是拦截层，而是遥测层：
+# 如果 pre-commit 被 --no-verify 跳过，这一步会把命中和仓库记进
+# ~/.git-guard/bypass.log，让「习惯性绕过」有痕迹可查。
+#
+# 只扫本次提交的差异（HEAD~1..HEAD），不扫整棵树，所以代价跟着提交走。
+
+GUARD_HOME="${GIT_GUARD_HOME:-$HOME/.git-guard}"
+SCAN="$GUARD_HOME/scan.py"
+LOG="$GUARD_HOME/bypass.log"
+
+[ -f "$SCAN" ] || exit 0
+
+PY=$(command -v python || command -v python3 || command -v py)
+[ -n "$PY" ] || exit 0
+
+PYTHONIOENCODING=utf-8
+PYTHONUTF8=1
+export PYTHONIOENCODING PYTHONUTF8
+
+if git rev-parse --verify -q HEAD~1 >/dev/null 2>&1; then
+  OUT=$("$PY" "$SCAN" --range HEAD~1..HEAD 2>&1)
+  rc=$?
+else
+  OUT=$("$PY" "$SCAN" --commit HEAD 2>&1)
+  rc=$?
+fi
+
+if [ "$rc" = "1" ]; then
+  echo ""
+  echo "[git-guard] ⚠ 这次提交里有命中 —— pre-commit 没跑或被跳过了。"
+  echo "$OUT" | sed -n '1,20p'
+  echo ""
+  TS=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo "-")
+  {
+    printf '=== %s\n' "$TS"
+    printf 'repo:   %s\n' "$(pwd)"
+    printf 'commit: %s\n' "$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
+    echo "$OUT" | sed -n '1,12p'
+  } >> "$LOG" 2>/dev/null
+  echo "[git-guard] 已记入 $LOG（只记录，不阻断）"
+  echo ""
+fi
+
+exit 0
