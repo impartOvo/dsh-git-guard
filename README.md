@@ -63,6 +63,9 @@ cp ~/.git-templates/hooks/pre-push   .git/hooks/
 
 docx/xlsx 这类 OOXML 走 zip 解包；判定不出编码的二进制（既不是合法 UTF-8、也没有 UTF-16 的零字节特征）会三种解码都扫一遍，宁可多一次正则。
 
+**大对象只扫头尾。** 超过 32MB 的对象只看头段 + 尾 2MB（`GIT_GUARD_MAX_BLOB` 可调），
+中间那段不扫，但会在输出里如实报出来——不会假装扫全了。单个 100MB 的补齐文件实测约 16s，这类大二进制是慢的。
+
 **业务数字不在检测范围内**：金额、销量、订单数、曝光、编号一律不报。
 理由：报表里数字无处不在，拦了必然逼出习惯性 `--no-verify`，防护反而失效。
 真正能定位到人的是**标识 + 联系方式**——ASIN、店铺名、手机号、邮箱、路径、凭据。
@@ -115,7 +118,7 @@ python ~/.git-guard/scan.py --staged --show-values
 ### 自检
 
 ```bash
-python tests/run_tests.py        # 16 条回归用例，只用标准库
+python tests/run_tests.py        # 24 条回归用例，只用标准库
 ```
 
 ---
@@ -135,7 +138,14 @@ cd <你的仓库>
 python ~/.git-guard/sanitize.py suggest
 ```
 
-生成 `map.suggested.txt`，自动给出店铺名 → `店铺A-DE`、ASIN → `B0ASIN0001`、邮箱 → `contact1@example.com` 的草稿映射，并列出**含敏感内容的二进制文档**（xlsx/docx 等）。
+生成 `map.suggested.txt`，自动给出店铺名 → `店铺A-DE`、ASIN → `B0ASIN0001`、邮箱 → `contact1@example.com`、
+手机号 → `PHONE_C1` 的草稿映射，并：
+
+- 点名**含敏感内容的二进制文档**（xlsx/docx 等）
+- 点名**含私钥或疑似凭据**的文件，但不给占位符——这类东西先吊销轮换，再从历史里 `--drop`
+- 列出**本地路径里的用户名**，清不清由你决定
+
+`suggest` 和 `scan` 共用同一套解码与检测形态，所以 UTF-16 / GBK / 旧式 `.xls` 的历史文件不会漏项。
 
 ### 第 2 步：人工过一遍
 
